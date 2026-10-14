@@ -1,0 +1,164 @@
+format_version: "13"
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+
+app:
+  envs:
+  # The stand-in API in tests/fake_api.py accepts only this key. It is not a
+  # real Asyntai key.
+  - TEST_API_KEY: test-key-2f8a1c
+  - TEST_API_PORT: "18765"
+  # For share-this-step
+  - BITRISE_STEP_ID: asyntai-ai-docs-sync
+  - BITRISE_STEP_VERSION: 1.0.0
+  - BITRISE_STEP_GIT_CLONE_URL: https://github.com/asyntai/bitrise-step-asyntai-ai-docs-sync.git
+  - MY_STEPLIB_REPO_FORK_GIT_URL: $MY_STEPLIB_REPO_FORK_GIT_URL
+
+workflows:
+  test:
+    title: Run the Step against a stand-in API
+    description: |-
+      Starts tests/fake_api.py, runs the Step several times the way a real
+      build runs it, and checks the result after every run.
+    before_run:
+    - _start_api
+    after_run:
+    - _stop_api
+    steps:
+    - path::./:
+        title: First run sends every file
+        inputs:
+        - docs_path: _tmp/docs
+        - asyntai_api_key: $TEST_API_KEY
+        - title_prefix: "Docs / "
+        - exclude: drafts/*
+        - base_url: http://127.0.0.1:$TEST_API_PORT
+    - script:
+        title: Check the first run
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "Summary: $ASYNTAI_DOCS_SYNC_SUMMARY"
+            test "$ASYNTAI_DOCS_SYNC_SUMMARY" = "Done. 3 added, 0 updated, 0 unchanged, 0 deleted, 1 skipped."
+    - path::./:
+        title: Second run with no change sends nothing
+        inputs:
+        - docs_path: _tmp/docs
+        - asyntai_api_key: $TEST_API_KEY
+        - title_prefix: "Docs / "
+        - exclude: drafts/*
+        - base_url: http://127.0.0.1:$TEST_API_PORT
+    - script:
+        title: Check the second run, then change one file and delete one
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "Summary: $ASYNTAI_DOCS_SYNC_SUMMARY"
+            test "$ASYNTAI_DOCS_SYNC_SUMMARY" = "Done. 0 added, 0 updated, 3 unchanged, 0 deleted, 1 skipped."
+            printf '# Setup\n\nPaste the script tag before the closing body tag.\n' > _tmp/docs/guides/setup.md
+            rm _tmp/docs/notes.txt
+    - path::./:
+        title: Third run updates one entry and removes one
+        inputs:
+        - docs_path: _tmp/docs
+        - asyntai_api_key: $TEST_API_KEY
+        - title_prefix: "Docs / "
+        - exclude: drafts/*
+        - prune: "yes"
+        - base_url: http://127.0.0.1:$TEST_API_PORT
+    - script:
+        title: Check the third run
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "Summary: $ASYNTAI_DOCS_SYNC_SUMMARY"
+            test "$ASYNTAI_DOCS_SYNC_SUMMARY" = "Done. 0 added, 1 updated, 1 unchanged, 1 deleted, 1 skipped."
+    - path::./:
+        title: Dry run needs no key and sends nothing
+        inputs:
+        - docs_path: _tmp/docs
+        - asyntai_api_key: ""
+        - dry_run: "yes"
+        - base_url: http://127.0.0.1:$TEST_API_PORT
+    - script:
+        title: Check the dry run and the stored entries
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "Summary: $ASYNTAI_DOCS_SYNC_SUMMARY"
+            test "$ASYNTAI_DOCS_SYNC_SUMMARY" = "Dry run. Nothing was sent."
+            touch _tmp/api.json.flush
+            for i in $(seq 1 50); do [ -f _tmp/api.json.flush ] || break; sleep 0.1; done
+            python3 - <<'EOF'
+            import json
+            state = json.load(open("_tmp/api.json"))
+            titles = sorted(e["title"] for e in state["entries"])
+            print("Stored:", titles)
+            assert titles == ["Docs / guides/setup.md", "Docs / index.md"], titles
+            setup = [e for e in state["entries"] if e["title"] == "Docs / guides/setup.md"][0]
+            assert "closing body tag" in setup["content"], setup["content"]
+            EOF
+
+  _start_api:
+    steps:
+    - script:
+        title: Make test docs and start the stand-in API
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -euo pipefail
+            rm -rf _tmp && mkdir -p _tmp/docs/guides _tmp/docs/drafts
+            printf '# Welcome\n\nAsyntai answers questions on your website.\n' > _tmp/docs/index.md
+            printf '# Setup\n\nPaste the script tag before the body ends.\n' > _tmp/docs/guides/setup.md
+            printf 'Plain text notes that are long enough to send.\n' > _tmp/docs/notes.txt
+            printf 'short\n' > _tmp/docs/tiny.md
+            printf '# Draft\n\nThis page is not ready for readers yet.\n' > _tmp/docs/drafts/wip.md
+            printf 'not a documentation file\n' > _tmp/docs/logo.png
+            nohup python3 tests/fake_api.py "$TEST_API_PORT" _tmp/api.json > _tmp/api.log 2>&1 &
+            for i in $(seq 1 50); do
+              if python3 -c "import socket,sys; s=socket.socket(); sys.exit(s.connect_ex(('127.0.0.1', $TEST_API_PORT)))"; then exit 0; fi
+              sleep 0.1
+            done
+            echo "The stand-in API did not start" >&2
+            cat _tmp/api.log >&2
+            exit 1
+
+  _stop_api:
+    steps:
+    - script:
+        title: Stop the stand-in API
+        is_always_run: true
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            touch _tmp/api.json.stop
+
+  audit-this-step:
+    steps:
+    - script:
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -ex
+            stepman audit --step-yml ./step.yml
+
+  share-this-step:
+    description: |-
+      Shares this Step to the Bitrise StepLib. Fork
+      https://github.com/bitrise-io/bitrise-steplib first and set
+      MY_STEPLIB_REPO_FORK_GIT_URL to the fork. Then run:
+      bitrise run share-this-step
+    before_run:
+    - audit-this-step
+    steps:
+    - script:
+        inputs:
+        - content: |-
+            #!/usr/bin/env bash
+            set -ex
+            bitrise share start -c "${MY_STEPLIB_REPO_FORK_GIT_URL}"
+            bitrise share create --stepid "${BITRISE_STEP_ID}" --tag "${BITRISE_STEP_VERSION}" --git "${BITRISE_STEP_GIT_CLONE_URL}"
+            bitrise share finish
